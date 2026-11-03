@@ -9,27 +9,87 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    name: checks
+    strategy:
+      matrix:
+        php: ['8.3', '8.5']   # 8.5 is what the IONOS server runs
+    name: test (PHP ${{ matrix.php }})
     steps:
       - uses: actions/checkout@v5
 
       - uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.5'   # what the IONOS server runs
+          php-version: ${{ matrix.php }}
+          extensions: curl, pdo_sqlite, pdo_mysql, mbstring
+          ini-values: error_reporting=E_ALL, display_errors=On
 
       - name: Check PHP syntax
-        run: |
-          files=$(find . -name '*.php' -not -path './lib/*' -not -path './.git/*')
-          if [ -n "$files" ]; then echo "$files" | xargs -n1 php -l; else echo "No PHP files yet"; fi
+        run: find . -name '*.php' -not -path './lib/*' -not -path './.git/*' -print0 | xargs -0 -n1 php -l
 
       - name: Check the deploy script
         run: bash -n deploy/ionos.sh
 
-  # Copies the site to IONOS after the checks pass on main (see deploy/ionos.sh).
+      - name: Run tests (fail on any warning or deprecation)
+        run: |
+          php tests/run.php 2>&1 | tee test-output.txt
+          if grep -E "(Deprecated|Warning|Notice):" test-output.txt; then exit 1; fi
+
+  # The same tests against MariaDB 11, the database IONOS provides.
+  test-mariadb:
+    runs-on: ubuntu-latest
+    services:
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: test
+          MARIADB_DATABASE: bins_test
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: curl, pdo_mysql, mbstring
+
+      - name: Run tests on MariaDB
+        env:
+          BINS_TEST_DSN: mysql:host=127.0.0.1;port=3306;dbname=bins_test;charset=utf8mb4
+          BINS_TEST_USER: root
+          BINS_TEST_PASSWORD: test
+        run: php tests/run.php
+
+  # Look-up, sign-up, confirm, reminder, manage and unsubscribe in a real browser.
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: pdo_sqlite, mbstring
+
+      - name: Install Playwright
+        run: |
+          npm install --no-save --no-package-lock playwright@1.63.0
+          npx playwright install --with-deps chromium
+
+      - name: Walk through the site
+        run: |
+          SITE="$RUNNER_TEMP/site"
+          bash tests/browser/setup.sh "$SITE" http://127.0.0.1:8140
+          php -S 127.0.0.1:8140 -t "$SITE/public" > "$RUNNER_TEMP/php.log" 2>&1 &
+          for i in $(seq 1 50); do curl -s -o /dev/null http://127.0.0.1:8140/ && break; sleep 0.2; done
+          node tests/browser/walkthrough.test.js http://127.0.0.1:8140 "$SITE"
+
+  # Copies the site to IONOS after all test jobs pass on main (see deploy/ionos.sh).
   # Skipped, with a notice, until the IONOS_SSH_HOST, IONOS_SSH_USER and
   # IONOS_SSH_KEY repository secrets exist.
   deploy:
-    needs: [test]
+    needs: [test, test-mariadb, browser]
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     concurrency: ionos-server-bins

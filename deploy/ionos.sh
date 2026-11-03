@@ -2,10 +2,13 @@
 # Deployment and server tasks for IONOS web hosting, run by GitHub Actions.
 # Adapted from NIMBY's deploy/ionos.sh (same server, same deploy key).
 #
-#   deploy/ionos.sh check    report what the server has (PHP, rsync, cron, config)
-#   deploy/ionos.sh deploy   copy the code to the server (and update tables, once there are any)
-#
-# More tasks (setup, cron, test reminders) arrive with the application code.
+#   deploy/ionos.sh check    report what the server has (PHP, rsync, cron, config, database)
+#   deploy/ionos.sh deploy   copy the code to the server, then update database tables
+#   deploy/ionos.sh setup    first-time setup: tables, first sync, cron jobs
+#   deploy/ionos.sh sync     read the council calendars now
+#   deploy/ionos.sh cron     (re)install the cron jobs: sync twice a day, reminders every 15 minutes
+#   deploy/ionos.sh test-reminder   send a sample reminder to the site's own mailbox only
+#   deploy/ionos.sh signup-open | signup-close | signup-status
 #
 # Needs environment variables SSH_HOST, SSH_USER and SSH_KEY (from repository
 # secrets). DEPLOY_PATH defaults to "bins", relative to the hosting home folder.
@@ -21,6 +24,8 @@ PINS="$HERE/ionos-host-keys.txt"
 SSH_DIR="${RUNNER_TEMP:-/tmp}/bins-ssh"
 KEY="$SSH_DIR/id_deploy"
 KNOWN="$SSH_DIR/known_hosts"
+SYNC_TAG='# bins-sync'
+REMIND_TAG='# bins-reminders'
 
 note() { echo "::notice title=BINS server::$*"; }
 fail() { echo "::error title=BINS server::$*"; exit 1; }
@@ -100,8 +105,16 @@ task_check() {
   note "crontab: $(remote 'command -v crontab >/dev/null && echo available || echo missing')"
   note "Server time: $(remote 'date "+%H:%M %Z"')"
   note "BINS folder: $(remote "[ -d '$DEPLOY_PATH' ] && echo present || echo missing")"
-  note "Code deployed: $(remote "[ -f '$DEPLOY_PATH/public/index.html' ] && echo yes || echo no")"
+  note "Code deployed: $(remote "[ -f '$DEPLOY_PATH/bootstrap.php' ] && echo yes || echo no")"
   note "config.php present: $(remote "[ -f '$DEPLOY_PATH/config.php' ] && echo yes || echo no")"
+  note "Cron jobs: sync $(remote "crontab -l 2>/dev/null | grep -q '$SYNC_TAG' && echo installed || echo 'not installed'"), reminders $(remote "crontab -l 2>/dev/null | grep -q '$REMIND_TAG' && echo installed || echo 'not installed'")"
+  if remote "[ -f '$DEPLOY_PATH/bin/healthcheck.php' ] && [ -f '$DEPLOY_PATH/config.php' ]"; then
+    report "cd '$DEPLOY_PATH' && $PHP bin/healthcheck.php" || true
+  fi
+}
+
+need_config() {
+  remote "[ -f '$DEPLOY_PATH/config.php' ]" || fail "config.php is not on the server yet (expected in the $DEPLOY_PATH folder)"
 }
 
 task_deploy() {
@@ -113,6 +126,7 @@ task_deploy() {
       --filter='P /config.php' \
       --filter='P /config.mail.php' \
       --filter='P /data/' \
+      --filter='P /public/data/*.json' \
       --exclude='/.git/' --exclude='/.github/' --exclude='/tests/' --exclude='/deploy/' \
       -e "ssh ${ssh_opts[*]}" \
       ./ "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/" 2>&1 | redact
@@ -123,14 +137,50 @@ task_deploy() {
     note "Deployed $rev with tar (rsync is missing, so files deleted from the repository stay on the server)"
   fi
 
-  if remote "[ -f '$DEPLOY_PATH/bin/migrate.php' ] && [ -f '$DEPLOY_PATH/config.php' ]"; then
+  if remote "[ -f '$DEPLOY_PATH/config.php' ]"; then
     need_php
     report "cd '$DEPLOY_PATH' && $PHP bin/migrate.php"
+  else
+    note "Database update skipped: config.php is not on the server yet"
   fi
+}
+
+task_setup() {
+  need_php
+  need_config
+  remote "chmod 600 '$DEPLOY_PATH/config.php' && mkdir -p '$DEPLOY_PATH/data/cache' '$DEPLOY_PATH/public/data'"
+  report "cd '$DEPLOY_PATH' && $PHP bin/migrate.php"
+  report "cd '$DEPLOY_PATH' && $PHP bin/sync.php" || true
+  install_cron
+  report "cd '$DEPLOY_PATH' && $PHP bin/healthcheck.php" || true
+}
+
+# The sync reads the council calendars at 05:23 and 16:23 server time (CET, an hour
+# ahead of the UK). Reminders run every 15 minutes; the script itself only acts
+# from 18:00 to 22:00 and 06:30 to 08:00 UK time. Output goes to data/cache/*.log.
+install_cron() {
+  remote "dir=\$(cd ~/'$DEPLOY_PATH' && pwd) \
+    && sync=\"23 5,16 * * * $PHP \$dir/bin/sync.php >> \$dir/data/cache/sync.log 2>&1 $SYNC_TAG\" \
+    && remind=\"1,16,31,46 * * * * $PHP \$dir/bin/send-reminders.php >> \$dir/data/cache/reminders.log 2>&1 $REMIND_TAG\" \
+    && (crontab -l 2>/dev/null | grep -vF '$SYNC_TAG' | grep -vF '$REMIND_TAG'; echo \"\$sync\"; echo \"\$remind\") | crontab -"
+  note "Cron jobs: $(remote "crontab -l 2>/dev/null | grep -cF -e '$SYNC_TAG' -e '$REMIND_TAG'") installed (sync 05:23 and 16:23 server time; reminders every 15 minutes)"
+}
+
+task_simple() {
+  need_php
+  need_config
+  report "cd '$DEPLOY_PATH' && $PHP $1"
 }
 
 case "${1:-}" in
   check)  connect; task_check ;;
   deploy) connect; task_deploy ;;
-  *) echo "Usage: $0 check|deploy" >&2; exit 2 ;;
+  setup)  connect; task_setup ;;
+  sync)   connect; task_simple "bin/sync.php"; task_simple "bin/healthcheck.php" || true ;;
+  cron)   connect; need_php; install_cron ;;
+  test-reminder) connect; task_simple "bin/send-reminders.php --test" ;;
+  signup-open)   connect; task_simple "bin/signup.php open" ;;
+  signup-close)  connect; task_simple "bin/signup.php close" ;;
+  signup-status) connect; task_simple "bin/signup.php status" ;;
+  *) echo "Usage: $0 check|deploy|setup|sync|cron|test-reminder|signup-open|signup-close|signup-status" >&2; exit 2 ;;
 esac

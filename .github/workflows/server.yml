@@ -10,6 +10,13 @@ on:
         options:
           - check
           - deploy
+          - setup
+          - sync
+          - cron
+          - test-reminder
+          - signup-status
+          - signup-open
+          - signup-close
         default: check
 
 concurrency: ionos-server-bins
