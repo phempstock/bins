@@ -1,0 +1,49 @@
+name: Tests and deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: checks
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'   # what the IONOS server runs
+
+      - name: Check PHP syntax
+        run: |
+          files=$(find . -name '*.php' -not -path './lib/*' -not -path './.git/*')
+          if [ -n "$files" ]; then echo "$files" | xargs -n1 php -l; else echo "No PHP files yet"; fi
+
+      - name: Check the deploy script
+        run: bash -n deploy/ionos.sh
+
+  # Copies the site to IONOS after the checks pass on main (see deploy/ionos.sh).
+  # Skipped, with a notice, until the IONOS_SSH_HOST, IONOS_SSH_USER and
+  # IONOS_SSH_KEY repository secrets exist.
+  deploy:
+    needs: [test]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    concurrency: ionos-server-bins
+    env:
+      SSH_HOST: ${{ secrets.IONOS_SSH_HOST }}
+      SSH_USER: ${{ secrets.IONOS_SSH_USER }}
+      SSH_KEY: ${{ secrets.IONOS_SSH_KEY }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Deploy to IONOS
+        run: |
+          if [ -z "$SSH_HOST" ] || [ -z "$SSH_USER" ] || [ -z "$SSH_KEY" ]; then
+            echo "::notice title=BINS server::Deployment skipped: IONOS secrets are not set yet"
+            exit 0
+          fi
+          bash deploy/ionos.sh deploy

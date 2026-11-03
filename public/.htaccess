@@ -1,0 +1,18 @@
+# The project folder's own .htaccess denies all web access (protecting config.php
+# and data/). Apache applies that to sub-folders too, so re-allow this one: public/
+# is the only folder that should be served.
+Require all granted
+
+<IfModule mod_deflate.c>
+    AddOutputFilterByType DEFLATE text/html text/css application/javascript application/json
+</IfModule>
+
+<IfModule mod_headers.c>
+    # Pages, scripts and styles: always check for a newer version (cheap 304 if unchanged).
+    <FilesMatch "\.(html|js|css)$">
+        Header set Cache-Control "no-cache"
+    </FilesMatch>
+    <FilesMatch "\.(woff2)$">
+        Header set Cache-Control "public, max-age=2592000"
+    </FilesMatch>
+</IfModule>

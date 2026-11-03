@@ -1,0 +1,13 @@
+# Local configuration (database and mail passwords) - never commit
+/config.php
+/config.mail.php
+
+# Written on the server (logs, cache)
+/data/
+
+# Tooling
+/vendor/
+node_modules/
+.DS_Store
+Thumbs.db
+desktop.ini
